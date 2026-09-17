@@ -1,16 +1,15 @@
 name: PR Review Agent
 
-# Automated PR review powered by Argo (runs on the self-hosted lambda5 runner,
-# which has network access to Argo). Same-repo PRs only: fork PRs do not receive
-# secrets and are intentionally skipped.
+# Automated PR review performed by a headless Hermes agent (backed by Argo
+# claude-opus-5) running on the self-hosted lambda5 runner, which has network
+# access to the local Argo proxy. Same-repo PRs only: fork PRs do not receive
+# secrets/tokens and are intentionally skipped.
 on:
   pull_request:
     types: [opened, reopened, synchronize]
   issue_comment:
     types: [created]
 
-# Avoid piling up reviews: cancel an in-flight review for a PR when a newer
-# event arrives for the same PR.
 concurrency:
   group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
@@ -21,8 +20,6 @@ permissions:
 
 jobs:
   review:
-    # Gate 1: for issue_comment, only run on comments that are on a PR (not plain
-    # issues) and ignore the agent's own comments to prevent loops.
     if: >-
       (github.event_name == 'pull_request') ||
       (github.event_name == 'issue_comment' &&
@@ -35,6 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          export PATH="$HOME/.local/bin:$PATH"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
             echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
@@ -42,18 +40,13 @@ jobs:
           else
             num="${{ github.event.issue.number }}"
             echo "number=$num" >> "$GITHUB_OUTPUT"
-            # Look up the PR head sha + repo for a comment event.
-            sha=$(gh api "repos/${{ github.repository }}/pulls/$num" -q '.head.sha')
-            same=$(gh api "repos/${{ github.repository }}/pulls/$num" -q '.head.repo.full_name == "${{ github.repository }}"')
-            echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
-            echo "same_repo=$same" >> "$GITHUB_OUTPUT"
+            echo "head_sha=$(gh api repos/${{ github.repository }}/pulls/$num -q .head.sha)" >> "$GITHUB_OUTPUT"
+            echo "same_repo=$(gh api repos/${{ github.repository }}/pulls/$num -q '.head.repo.full_name == "${{ github.repository }}"')" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Skip fork PRs
         if: steps.pr.outputs.same_repo != 'true'
-        run: |
-          echo "PR is from a fork; skipping (secrets unavailable to fork PRs by design)."
-          exit 0
+        run: echo "PR is from a fork; skipping (secrets/token unavailable to fork PRs by design)."
 
       - name: Checkout PR head
         if: steps.pr.outputs.same_repo == 'true'
@@ -62,18 +55,16 @@ jobs:
           ref: ${{ steps.pr.outputs.head_sha }}
           fetch-depth: 0
 
-      - name: Run review agent
+      - name: Review with Hermes (Argo)
         if: steps.pr.outputs.same_repo == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          ARGO_TOKEN: ${{ secrets.ARGO_TOKEN }}
-          ARGO_URL: ${{ secrets.ARGO_URL }}
-          ARGO_MODEL: ${{ secrets.ARGO_MODEL }}
-          ARGO_USER: ${{ secrets.ARGO_USER }}
         run: |
-          python3 -m venv .review-venv
-          ./.review-venv/bin/pip -q install --upgrade pip requests >/dev/null
-          ./.review-venv/bin/python .github/scripts/pr_review.py
+          export PATH="$HOME/.local/bin:$PATH"
+          PROMPT="$(cat .github/pr-review-prompt.md)"
+          PROMPT="Review pull request #${PR_NUMBER} in brettin/SystemTests now.
+
+          ${PROMPT}"
+          hermes chat -q "$PROMPT"
