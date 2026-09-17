@@ -10,6 +10,7 @@ A practical guide to using the Argo-backed model endpoint hosted on `lambda5`.
 
 1. [Setting up Cursor to use the lambda5 endpoint](#1-setting-up-cursor-to-use-the-lambda5-endpoint)
 2. [Cheatsheet](#2-cheatsheet)
+3. [Automated PR review agent](#3-automated-pr-review-agent)
 
 ---
 
@@ -441,4 +442,105 @@ lsof -iTCP:44497 -sTCP:LISTEN
 | OpenAI API Key           | `YOUR_TOKEN`                                 |
 | Model                    | e.g. `argo:gpt-4o`                           |
 
+---
+
+## 3. Automated PR review agent
+
+This repository runs an automated pull-request reviewer. When a same-repo PR is
+opened, reopened, updated with new commits, or gets a new human comment, a
+**headless Hermes agent** (backed by **Argo `claude-opus-5`**) reviews the
+change and posts a formal GitHub review: **Approve** or **Request changes**.
+
+Ops and runner setup details live in
+[`.github/PR-REVIEW-AGENT.md`](../.github/PR-REVIEW-AGENT.md). Review standards
+are edited in [`.github/pr-review-prompt.md`](../.github/pr-review-prompt.md).
+
+### 3.1 How it works
+
+```
+PR event → GitHub Actions (self-hosted lambda5 runner)
+        → hermes chat -q "<review prompt>"
+             → Hermes reads the diff, repo, docs, and PR discussion
+             → posts APPROVE or REQUEST_CHANGES via `gh pr review`
+```
+
+| Piece | Role |
+| ----- | ---- |
+| Workflow | [`.github/workflows/pr-review.yml`](../.github/workflows/pr-review.yml) — triggers and concurrency |
+| Prompt | [`.github/pr-review-prompt.md`](../.github/pr-review-prompt.md) — what the agent must check and how to format the review |
+| Runner | Self-hosted on `lambda5` (`runs-on: [self-hosted, lambda5]`) so it can reach the local Argo proxy |
+| Model | Hermes configured with provider `custom` → `http://localhost:44497/v1`, model `argo:claude-opus-5` |
+
+The workflow only runs for **same-repository** PRs. Fork PRs are skipped on
+purpose (they do not receive the workflow token).
+
+### 3.2 What triggers a review
+
+| Event | When |
+| ----- | ---- |
+| `pull_request` → `opened` / `reopened` / `synchronize` | PR created, reopened, or pushed with new commits |
+| `issue_comment` → `created` | New comment on a PR (bot comments are ignored) |
+
+Concurrent runs for the same PR are cancelled so only the latest review finishes.
+
+### 3.3 What the agent does
+
+On each run the job checks out the PR head, then asks Hermes to:
+
+1. Load PR metadata and the full diff (`gh pr view`, `gh pr diff`).
+2. Read the touched files plus surrounding code and docs — not the diff alone.
+3. Read prior comments and reviews, and focus on what changed since the last pass.
+4. Judge correctness, security, error handling, edge cases, clarity, consistency
+   with the repo/docs, and test coverage.
+5. Post **exactly one** formal review via `gh pr review`:
+   - `--approve` when there are no high/medium-severity issues
+   - `--request-changes` when the author must fix something
+
+The review body is Markdown: a short summary, strengths, issues tagged
+`[HIGH]` / `[MEDIUM]` / `[LOW]` with file references, a required-changes
+checklist when requesting changes, and a footer noting the review is automated.
+
+### 3.4 What you will see on a PR
+
+- Reviews appear as **`github-actions[bot]`**.
+- A clean change gets an approval with a short rationale.
+- Problems get a request-changes review with actionable items.
+- **Self-authored PRs:** GitHub forbids approving your own PR with the workflow
+  token, so the agent falls back to a **comment** that still states the verdict.
+- A bot `REQUEST_CHANGES` does **not** satisfy branch-protection rules that
+  require human approvals; it still flags the PR for the author.
+
+### 3.5 Customizing the review
+
+Edit [`.github/pr-review-prompt.md`](../.github/pr-review-prompt.md) to change
+standards, severity expectations, or the required review format. The workflow
+injects that file into the Hermes prompt on every run — no workflow edit needed
+for prompt-only changes.
+
+### 3.6 Operational requirements
+
+Reviews fail if any of these are down on `lambda5`:
+
+- The GitHub Actions self-hosted runner (`gh-runner.service`)
+- The Argo OpenAI-compatible proxy on `localhost:44497`
+- Hermes, configured with `ARGO_API_KEY` and model `argo:claude-opus-5`
+
+Check the runner with:
+
+```bash
+systemctl --user status gh-runner.service
+journalctl --user -u gh-runner.service -f
+```
+
+Full dependency table and setup notes:
+[`.github/PR-REVIEW-AGENT.md`](../.github/PR-REVIEW-AGENT.md).
+
+### 3.7 Quick checklist
+
+- [ ] PR is from the same repository (not a fork)
+- [ ] Self-hosted runner on `lambda5` is online
+- [ ] Argo proxy is listening on `localhost:44497`
+- [ ] Hermes can reach Argo with `argo:claude-opus-5`
+- [ ] After open / push / human comment, the **PR Review Agent** workflow ran
+- [ ] A bot review (or fallback comment on self-authored PRs) appears on the PR
 
