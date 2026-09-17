@@ -1,0 +1,79 @@
+name: PR Review Agent
+
+# Automated PR review powered by Argo (runs on the self-hosted lambda5 runner,
+# which has network access to Argo). Same-repo PRs only: fork PRs do not receive
+# secrets and are intentionally skipped.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+
+# Avoid piling up reviews: cancel an in-flight review for a PR when a newer
+# event arrives for the same PR.
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    # Gate 1: for issue_comment, only run on comments that are on a PR (not plain
+    # issues) and ignore the agent's own comments to prevent loops.
+    if: >-
+      (github.event_name == 'pull_request') ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.type != 'Bot')
+    runs-on: [self-hosted, lambda5]
+    steps:
+      - name: Resolve PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "same_repo=${{ github.event.pull_request.head.repo.full_name == github.repository }}" >> "$GITHUB_OUTPUT"
+          else
+            num="${{ github.event.issue.number }}"
+            echo "number=$num" >> "$GITHUB_OUTPUT"
+            # Look up the PR head sha + repo for a comment event.
+            sha=$(gh api "repos/${{ github.repository }}/pulls/$num" -q '.head.sha')
+            same=$(gh api "repos/${{ github.repository }}/pulls/$num" -q '.head.repo.full_name == "${{ github.repository }}"')
+            echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+            echo "same_repo=$same" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip fork PRs
+        if: steps.pr.outputs.same_repo != 'true'
+        run: |
+          echo "PR is from a fork; skipping (secrets unavailable to fork PRs by design)."
+          exit 0
+
+      - name: Checkout PR head
+        if: steps.pr.outputs.same_repo == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+
+      - name: Run review agent
+        if: steps.pr.outputs.same_repo == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          ARGO_TOKEN: ${{ secrets.ARGO_TOKEN }}
+          ARGO_URL: ${{ secrets.ARGO_URL }}
+          ARGO_MODEL: ${{ secrets.ARGO_MODEL }}
+          ARGO_USER: ${{ secrets.ARGO_USER }}
+        run: |
+          python3 -m venv .review-venv
+          ./.review-venv/bin/pip -q install --upgrade pip requests >/dev/null
+          ./.review-venv/bin/python .github/scripts/pr_review.py
